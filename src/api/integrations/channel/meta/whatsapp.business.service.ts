@@ -847,6 +847,47 @@ export class BusinessStartupService extends ChannelStartupService {
     }
   }
 
+  protected async messageEchoHandle(received: any, database: Database, settings: any) {
+    const messageEchoes = Array.isArray(received.message_echoes) ? received.message_echoes : [];
+
+    for await (const messageEcho of messageEchoes) {
+      const remoteNumber = messageEcho?.to;
+
+      if (!remoteNumber) {
+        this.logger.error('ChannelStartupService -> messageEchoHandle -> message echo recipient not found');
+        continue;
+      }
+
+      this.phoneNumber = createJid(remoteNumber);
+
+      const businessNumber =
+        messageEcho?.from ?? received.metadata?.display_phone_number ?? received.metadata?.phone_number_id;
+
+      const echoReceived = {
+        ...received,
+        metadata: {
+          ...received.metadata,
+          phone_number_id: businessNumber,
+        },
+        contacts:
+          Array.isArray(received.contacts) && received.contacts.length > 0
+            ? received.contacts
+            : [
+                {
+                  profile: {
+                    phone: remoteNumber,
+                    name: '',
+                  },
+                  wa_id: remoteNumber,
+                },
+              ],
+        messages: [messageEcho],
+      };
+
+      await this.messageHandle(echoReceived, database, settings);
+    }
+  }
+
   private convertMessageToRaw(message: any, content: any) {
     let convertMessage: any;
 
@@ -950,11 +991,16 @@ export class BusinessStartupService extends ChannelStartupService {
         } else {
           this.logger.warn(`Tipo de mensaje no reconocido: ${message.type}`);
         }
+      } else if (content.message_echoes && content.message_echoes.length > 0) {
+        const messageEcho = content.message_echoes[0];
+        this.logger.log(`Tipo de message echo recebido: ${messageEcho.type}`);
+
+        await this.messageEchoHandle(content, database, settings);
       } else if (content.statuses) {
         // Procesar actualizaciones de estado
         this.messageHandle(content, database, settings);
       } else {
-        this.logger.warn('No se encontraron mensajes ni estados en el contenido recibido');
+        this.logger.warn('No se encontraron mensajes, ecos de mensajes ni estados en el contenido recibido');
       }
     } catch (error) {
       this.logger.error('Error en eventHandler:');
