@@ -403,7 +403,7 @@ export class BusinessStartupService extends ChannelStartupService {
     return messageType;
   }
 
-  protected async messageHandle(received: any, database: Database, settings: any) {
+  protected async messageHandle(received: any, database: Database, settings: any, echoRecipient?: string) {
     try {
       let messageRaw: any;
       let pushName: any;
@@ -418,8 +418,8 @@ export class BusinessStartupService extends ChannelStartupService {
 
         const key = {
           id: message.id,
-          remoteJid: this.phoneNumber,
-          fromMe: message.from === received.metadata.phone_number_id,
+          remoteJid: echoRecipient ?? this.phoneNumber,
+          fromMe: !!echoRecipient || message.from === received.metadata.phone_number_id,
         };
 
         if (message.type === 'sticker') {
@@ -692,7 +692,7 @@ export class BusinessStartupService extends ChannelStartupService {
 
         sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
 
-        this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
+        this.sendDataWebhook(Events.MESSAGES_UPSERT, echoRecipient ? { ...messageRaw, to: echoRecipient } : messageRaw);
 
         await chatbotController.emit({
           instance: { instanceName: this.instance.name, instanceId: this.instanceId },
@@ -722,11 +722,14 @@ export class BusinessStartupService extends ChannelStartupService {
         }
 
         const contact = await this.prismaRepository.contact.findFirst({
-          where: { instanceId: this.instanceId, remoteJid: key.remoteJid },
+          where: {
+            instanceId: this.instanceId,
+            remoteJid: echoRecipient ? { in: [key.remoteJid, remoteJid] } : key.remoteJid,
+          },
         });
 
         const contactRaw: any = {
-          remoteJid,
+          remoteJid: echoRecipient && contact ? contact.remoteJid : remoteJid,
           pushName,
           // profilePicUrl: '',
           instanceId: this.instanceId,
@@ -737,13 +740,6 @@ export class BusinessStartupService extends ChannelStartupService {
         }
 
         if (contact) {
-          const contactRaw: any = {
-            remoteJid,
-            pushName,
-            // profilePicUrl: '',
-            instanceId: this.instanceId,
-          };
-
           this.sendDataWebhook(Events.CONTACTS_UPDATE, contactRaw);
 
           if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
@@ -755,7 +751,7 @@ export class BusinessStartupService extends ChannelStartupService {
           }
 
           await this.prismaRepository.contact.updateMany({
-            where: { remoteJid: contact.remoteJid },
+            where: { instanceId: this.instanceId, remoteJid: contact.remoteJid },
             data: contactRaw,
           });
           return;
@@ -849,42 +845,62 @@ export class BusinessStartupService extends ChannelStartupService {
 
   protected async messageEchoHandle(received: any, database: Database, settings: any) {
     const messageEchoes = Array.isArray(received.message_echoes) ? received.message_echoes : [];
+    const contacts = Array.isArray(received.contacts) ? received.contacts : [];
 
     for await (const messageEcho of messageEchoes) {
-      const remoteNumber = messageEcho?.to;
+      // Preserve Meta's WhatsApp ID without phone-number rewriting or treating a LID as a phone number.
+      const remoteNumber =
+        typeof messageEcho?.to === 'string' ? /^(\d+)(?:@s\.whatsapp\.net)?$/.exec(messageEcho.to)?.[1] : undefined;
 
       if (!remoteNumber) {
-        this.logger.error('ChannelStartupService -> messageEchoHandle -> message echo recipient not found');
+        this.logger.error(
+          'ChannelStartupService -> messageEchoHandle -> message echo recipient phone number not found',
+        );
         continue;
       }
 
-      this.phoneNumber = createJid(remoteNumber);
+      const echoRecipient = `${remoteNumber}@s.whatsapp.net`;
+      this.phoneNumber = echoRecipient;
 
-      const businessNumber =
-        messageEcho?.from ?? received.metadata?.display_phone_number ?? received.metadata?.phone_number_id;
+      const recipientIds = [remoteNumber, echoRecipient];
+      const receivedContact = contacts.find((contact) =>
+        recipientIds.includes(contact?.wa_id || contact?.profile?.phone),
+      );
+      let pushName = receivedContact?.profile?.name?.trim() || '';
+
+      if (!pushName) {
+        try {
+          const savedContact = await this.prismaRepository.contact.findFirst({
+            where: {
+              instanceId: this.instanceId,
+              remoteJid: { in: recipientIds },
+              pushName: { not: '' },
+            },
+            select: { pushName: true },
+          });
+          pushName = savedContact?.pushName?.trim() || '';
+        } catch {
+          this.logger.warn('ChannelStartupService -> messageEchoHandle -> could not load recipient name');
+        }
+      }
 
       const echoReceived = {
         ...received,
-        metadata: {
-          ...received.metadata,
-          phone_number_id: businessNumber,
-        },
-        contacts:
-          Array.isArray(received.contacts) && received.contacts.length > 0
-            ? received.contacts
-            : [
-                {
-                  profile: {
-                    phone: remoteNumber,
-                    name: '',
-                  },
-                  wa_id: remoteNumber,
-                },
-              ],
+        contacts: [
+          {
+            ...receivedContact,
+            profile: {
+              ...receivedContact?.profile,
+              phone: remoteNumber,
+              name: pushName,
+            },
+            wa_id: remoteNumber,
+          },
+        ],
         messages: [messageEcho],
       };
 
-      await this.messageHandle(echoReceived, database, settings);
+      await this.messageHandle(echoReceived, database, settings, echoRecipient);
     }
   }
 
