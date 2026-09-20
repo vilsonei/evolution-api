@@ -134,6 +134,16 @@ export class BusinessStartupService extends ChannelStartupService {
     }
 
     try {
+      if (
+        Array.isArray(content.statuses) &&
+        content.statuses.length > 0 &&
+        !content.messages?.length &&
+        !content.message_echoes?.length
+      ) {
+        await this.eventHandler(content);
+        return;
+      }
+
       const message = Array.isArray(content.messages) ? content.messages[0] : undefined;
 
       const status = Array.isArray(content.statuses) ? content.statuses[0] : undefined;
@@ -763,83 +773,48 @@ export class BusinessStartupService extends ChannelStartupService {
           data: contactRaw,
         });
       }
-      if (received.statuses) {
-        for await (const item of received.statuses) {
-          const key = {
-            id: item.id,
-            remoteJid: this.phoneNumber,
-            fromMe: this.phoneNumber === received.metadata.phone_number_id,
-          };
-          if (settings?.groups_ignore && key.remoteJid.includes('@g.us')) {
-            return;
-          }
-          if (key.remoteJid !== 'status@broadcast' && !key?.remoteJid?.match(/(:\d+)/)) {
-            const findMessage = await this.prismaRepository.message.findFirst({
-              where: {
-                instanceId: this.instanceId,
-                key: {
-                  path: ['id'],
-                  equals: key.id,
-                },
-              },
-            });
-
-            if (!findMessage) {
-              return;
-            }
-
-            if (item.message === null && item.status === undefined) {
-              this.sendDataWebhook(Events.MESSAGES_DELETE, key);
-
-              const message: any = {
-                messageId: findMessage.id,
-                keyId: key.id,
-                remoteJid: key.remoteJid,
-                fromMe: key.fromMe,
-                participant: key?.remoteJid,
-                status: 'DELETED',
-                instanceId: this.instanceId,
-              };
-
-              await this.prismaRepository.messageUpdate.create({
-                data: message,
-              });
-
-              if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-                this.chatwootService.eventWhatsapp(
-                  Events.MESSAGES_DELETE,
-                  { instanceName: this.instance.name, instanceId: this.instanceId },
-                  { key: key },
-                );
-              }
-
-              return;
-            }
-
-            const message: any = {
-              messageId: findMessage.id,
-              keyId: key.id,
-              remoteJid: key.remoteJid,
-              fromMe: key.fromMe,
-              participant: key?.remoteJid,
-              status: item.status.toUpperCase(),
-              instanceId: this.instanceId,
-            };
-
-            this.sendDataWebhook(Events.MESSAGES_UPDATE, message);
-
-            await this.prismaRepository.messageUpdate.create({
-              data: message,
-            });
-
-            if (findMessage.webhookUrl) {
-              await axios.post(findMessage.webhookUrl, message);
-            }
-          }
-        }
-      }
     } catch (error) {
       this.logger.error(error);
+    }
+  }
+
+  protected async messageStatusHandle(received: any) {
+    const statuses = Array.isArray(received.statuses) ? received.statuses : [];
+
+    for (const item of statuses) {
+      const recipientNumber =
+        typeof item?.recipient_id === 'string'
+          ? /^(\d+)(?:@s\.whatsapp\.net)?$/.exec(item.recipient_id)?.[1]
+          : undefined;
+
+      if (!item?.id || !recipientNumber) {
+        this.logger.warn('ChannelStartupService -> messageStatusHandle -> message ID or recipient not found');
+        continue;
+      }
+
+      const remoteJid = `${recipientNumber}@s.whatsapp.net`;
+
+      if (item.message === null && item.status === undefined) {
+        await this.sendDataWebhook(Events.MESSAGES_DELETE, { id: item.id, remoteJid, fromMe: true }, true, ['webhook']);
+        continue;
+      }
+
+      if (typeof item.status !== 'string' || !item.status) {
+        this.logger.warn('ChannelStartupService -> messageStatusHandle -> message status not found');
+        continue;
+      }
+
+      const message = {
+        ...item,
+        keyId: item.id,
+        remoteJid,
+        fromMe: true,
+        participant: remoteJid,
+        status: item.status.toUpperCase(),
+        instanceId: this.instanceId,
+      };
+
+      await this.sendDataWebhook(Events.MESSAGES_UPDATE, message, true, ['webhook']);
     }
   }
 
@@ -980,6 +955,14 @@ export class BusinessStartupService extends ChannelStartupService {
       this.logger.log('Contenido recibido en eventHandler:');
       this.logger.log(JSON.stringify(content, null, 2));
 
+      if (Array.isArray(content.statuses) && content.statuses.length > 0) {
+        await this.messageStatusHandle(content);
+
+        if (!content.messages?.length && !content.message_echoes?.length) {
+          return;
+        }
+      }
+
       const database = this.configService.get<Database>('DATABASE');
       const settings = await this.findSettings();
 
@@ -1012,9 +995,6 @@ export class BusinessStartupService extends ChannelStartupService {
         this.logger.log(`Tipo de message echo recebido: ${messageEcho.type}`);
 
         await this.messageEchoHandle(content, database, settings);
-      } else if (content.statuses) {
-        // Procesar actualizaciones de estado
-        this.messageHandle(content, database, settings);
       } else {
         this.logger.warn('No se encontraron mensajes, ecos de mensajes ni estados en el contenido recibido');
       }
