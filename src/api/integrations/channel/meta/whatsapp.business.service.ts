@@ -782,17 +782,19 @@ export class BusinessStartupService extends ChannelStartupService {
     const statuses = Array.isArray(received.statuses) ? received.statuses : [];
 
     for (const item of statuses) {
+      const isFailed = typeof item?.status === 'string' && item.status.toUpperCase() === 'FAILED';
       const recipientNumber =
         typeof item?.recipient_id === 'string'
           ? /^(\d+)(?:@s\.whatsapp\.net)?$/.exec(item.recipient_id)?.[1]
           : undefined;
 
-      if (!item?.id || !recipientNumber) {
+      if (!item?.id || (!recipientNumber && !isFailed)) {
         this.logger.warn('ChannelStartupService -> messageStatusHandle -> message ID or recipient not found');
         continue;
       }
 
-      const remoteJid = `${recipientNumber}@s.whatsapp.net`;
+      // A failed delivery can still be correlated by its message ID without a recipient phone number.
+      const remoteJid = recipientNumber ? `${recipientNumber}@s.whatsapp.net` : null;
 
       if (item.message === null && item.status === undefined) {
         await this.sendDataWebhook(Events.MESSAGES_DELETE, { id: item.id, remoteJid, fromMe: true }, true, ['webhook']);
@@ -813,6 +815,18 @@ export class BusinessStartupService extends ChannelStartupService {
         status: item.status.toUpperCase(),
         instanceId: this.instanceId,
       };
+
+      if (isFailed) {
+        this.logger.warn({
+          local: 'BusinessStartupService.messageStatusHandle',
+          message: 'Meta message delivery failed; forwarding status to instance webhook',
+          instanceId: this.instanceId,
+          keyId: item.id,
+          recipientId: item.recipient_id ?? null,
+          remoteJid,
+          errors: item.errors,
+        });
+      }
 
       await this.sendDataWebhook(Events.MESSAGES_UPDATE, message, true, ['webhook']);
     }
